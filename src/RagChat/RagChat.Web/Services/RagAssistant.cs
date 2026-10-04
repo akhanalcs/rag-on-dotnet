@@ -12,17 +12,16 @@ public sealed class RagAssistant(SemanticSearch search)
         Do not answer questions about anything else.
         Use only simple markdown to format your responses.
         Use the LoadDocuments tool to prepare for searches before answering any questions.
-        Use the Search tool to find relevant information. When you do this, end your
-        reply with citations in the special XML format:
-        <citation filename='string'>exact quote here</citation>
-        Always include the citation in your response if there are results.
-        The quote must be max 5 words, taken word-for-word from the search result, and is the basis for why the citation is relevant.
-        Don't refer to the presence of citations; just emit these tags right at the end, with no surrounding text.
+        Use the Search tool to find relevant information. Each result has a numeric id.
+        Answer only from search results. After each sentence that uses a result, cite its id in square brackets, like [3] or [1][4].
+        Cite only ids you received. Don't add a separate list of sources.
+        If the results don't answer the question, say so instead of guessing.
         ";
 
     // Tools are created per user: the user's groups are captured here, in code.
     // They are NOT a tool parameter, so the model (or a prompt-injection) can't choose or widen them.
-    public ChatOptions CreateChatOptions(IReadOnlyCollection<string> userGroups) => new()
+    // Every result is registered in `sources`, which turns the model's [n] citations back into exact chunks.
+    public ChatOptions CreateChatOptions(IReadOnlyCollection<string> userGroups, CitationSources sources) => new()
     {
         Tools =
         [
@@ -36,10 +35,10 @@ public sealed class RagAssistant(SemanticSearch search)
                     [Description("If possible, specify the filename to search that file only. If not provided or empty, the search includes all files.")] string? filenameFilter = null) =>
                 {
                     var results = await search.SearchAsync(searchPhrase, filenameFilter, userGroups, maxResults: 5);
-                    // Provenance travels with each result, so answers can point to the page/section
+                    // Provenance travels with each result; the id is what the model cites
                     return results.Select(hit =>
-                        $"<result filename=\"{hit.Chunk.DocumentId}\" page=\"{hit.Chunk.PageNumber}\" section=\"{hit.Chunk.Context}\">{hit.Chunk.Text}</result>");
-                },
+                        $"<result id=\"{sources.Add(hit)}\" filename=\"{hit.Chunk.DocumentId}\" page=\"{hit.Chunk.PageNumber}\" section=\"{hit.Chunk.Context}\">{hit.Chunk.Text}</result>").ToList();
+                }, 
                 name: "Search",
                 description: "Searches for information using a phrase or keyword. Relies on documents already being loaded.")
         ]

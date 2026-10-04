@@ -1,4 +1,4 @@
-using System.Security.Cryptography;
+﻿using System.Security.Cryptography;
 using System.Text;
 using Azure.Search.Documents;
 using Azure.Search.Documents.Indexes;
@@ -13,6 +13,7 @@ public class DataIngestor(
     ILogger<DataIngestor> logger,
     SearchIndexClient indexClient,
     IEmbeddingGenerator<string, Embedding<float>> embeddingGenerator,
+    DocumentIntelligenceReader documentReader,
     DocumentAccessPolicy accessPolicy)
 {
     private readonly SearchClient _searchClient = indexClient.GetSearchClient(IngestedChunk.IndexName);
@@ -45,7 +46,7 @@ public class DataIngestor(
 
         IEnumerable<DocumentBlock>? blocks = file.Extension.ToLowerInvariant() switch
         {
-            ".pdf" => PdfReader.Read(file.FullName),
+            ".pdf" or ".docx" => await documentReader.ReadAsync(file.FullName),
             ".md" => MarkdownReader.Read(await File.ReadAllTextAsync(file.FullName)),
             _ => null
         };

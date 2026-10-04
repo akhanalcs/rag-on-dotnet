@@ -1,4 +1,6 @@
-﻿using Microsoft.Extensions.AI;
+﻿using Azure.AI.DocumentIntelligence;
+using Azure.Identity;
+using Microsoft.Extensions.AI;
 using RagChat.Web.Services.Ingestion;
 using RagChat.Web.Services.Security;
 
@@ -18,6 +20,12 @@ public static class RagChatServiceExtensions
 
         // Azure AI Search (hybrid + semantic ranker). Managed identity, no keys.
         builder.AddAzureSearchClient("search");
+        // Document Intelligence (no Aspire client integration, so registered by hand). Entra ID, no keys.
+        builder.Services.AddSingleton(_ => new DocumentIntelligenceClient(
+            new Uri(builder.Configuration.GetConnectionString("docintel") ?? throw new InvalidOperationException("Missing ConnectionStrings:docintel")),
+            new DefaultAzureCredential()));
+        builder.Services.AddSingleton<DocumentIntelligenceReader>();
+
         builder.Services.AddSingleton<DocumentAccessPolicy>();
         builder.Services.AddSingleton<DataIngestor>();
         builder.Services.AddSingleton<SemanticSearch>();

@@ -10,6 +10,8 @@
 <ChatHeader OnNewChat="@ResetConversationAsync" />
 <p class="page-width">Signed in as <b>@userName</b> · Access: <b>@(userGroups.Count > 0 ? string.Join(", ", userGroups) : "none")</b></p>
 
+@* Citation numbers in answers ([3]) are looked up in this conversation's search results *@
+<CascadingValue Value="citationSources" IsFixed="true">
 <ChatMessageList Messages="@messages" InProgressMessage="@currentResponseMessage">
     <NoMessagesContent>
         <div>To get started, try asking about these example documents. You can replace these with your own data and replace this message.</div>
@@ -17,6 +19,7 @@
         <ChatCitation File="Example_GPS_Watch.md"/>
     </NoMessagesContent>
 </ChatMessageList>
+</CascadingValue>
 
 <div class="chat-container">
     <ChatSuggestions OnSelected="@AddUserMessageAsync" @ref="@chatSuggestions" />
@@ -32,6 +35,7 @@
     private string? userName;
     private IReadOnlyCollection<string> userGroups = [];
     private ChatOptions chatOptions = default!;
+    private readonly CitationSources citationSources = new();
     private readonly List<ChatMessage> messages = new();
     private CancellationTokenSource? currentResponseCancellation;
     private ChatMessage? currentResponseMessage;
@@ -47,7 +51,7 @@
 
         statefulMessageCount = 0;
         messages.Add(new(ChatRole.System, RagAssistant.SystemPrompt));
-        chatOptions = Assistant.CreateChatOptions(userGroups);
+        chatOptions = Assistant.CreateChatOptions(userGroups, citationSources);
     }
 
     private async Task AddUserMessageAsync(ChatMessage userMessage)
@@ -101,6 +105,7 @@
         messages.Clear();
         messages.Add(new(ChatRole.System, RagAssistant.SystemPrompt));
         chatOptions.ConversationId = null;
+        citationSources.Clear();
         statefulMessageCount = 0;
         chatSuggestions?.Clear();
         await chatInput!.FocusAsync();

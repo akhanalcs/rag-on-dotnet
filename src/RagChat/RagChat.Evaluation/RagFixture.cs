@@ -1,7 +1,6 @@
-﻿using System.Text.Json;
-using System.Text.RegularExpressions;
-using Aspire.Hosting;
+﻿using Aspire.Hosting;
 using Aspire.Hosting.ApplicationModel;
+using Aspire.Hosting.Azure;
 using Aspire.Hosting.Testing;
 using Microsoft.Extensions.AI;
 using Microsoft.Extensions.AI.Evaluation;
@@ -24,8 +23,8 @@ public sealed class RagCollection : ICollectionFixture<RagFixture>
     public const string Name = "Rag";
 }
 
-// Starts the AppHost once (Azure OpenAI, Azure AI Search), then builds the same RAG services the web app uses.
-public sealed partial class RagFixture : IAsyncLifetime
+// Starts the AppHost once (Azure OpenAI, Azure AI Search, Document Intelligence), then builds the same RAG services the web app uses.
+public sealed class RagFixture : IAsyncLifetime
 {
     private DistributedApplication? _app;
     private IHost? _host;
@@ -39,12 +38,17 @@ public sealed partial class RagFixture : IAsyncLifetime
         _app = await appHost.BuildAsync();
         await _app.StartAsync();
         await _app.ResourceNotifications.WaitForResourceAsync("search", KnownResourceStates.Running);
+        await _app.ResourceNotifications.WaitForResourceAsync("docintel", KnownResourceStates.Running);
         await _app.ResourceNotifications.WaitForResourceAsync("openai", KnownResourceStates.Running);
 
         // Content root = test output folder, which holds the web app's appsettings.json (incl. the DocumentAccess policy) and Data/
         var builder = Host.CreateApplicationBuilder(new HostApplicationBuilderSettings { ContentRootPath = AppContext.BaseDirectory });
         builder.Configuration["ConnectionStrings:openai"] = await _app.GetConnectionStringAsync("openai");
         builder.Configuration["ConnectionStrings:search"] = await _app.GetConnectionStringAsync("search");
+        // docintel is a custom Azure resource (no connection string), so read the endpoint it outputs after provisioning
+        var docIntel = _app.Services.GetRequiredService<DistributedApplicationModel>().Resources
+            .OfType<AzureProvisioningResource>().Single(r => r.Name == "docintel");
+        builder.Configuration["ConnectionStrings:docintel"] = (string?)docIntel.Outputs["endpoint"];
         builder.AddRagChat(ingestionDirectory: Path.Combine(AppContext.BaseDirectory, "Data"));
         _host = builder.Build();
 
@@ -71,22 +75,13 @@ public sealed partial class RagFixture : IAsyncLifetime
         var chatClient = Services.GetRequiredService<IChatClient>();
 
         // It asks the question the way the UI does: system prompt + question + the assistant's tools, then calls GetResponseAsync.
+        var sources = new CitationSources();
         List<ChatMessage> messages = [new(ChatRole.System, RagAssistant.SystemPrompt), new(ChatRole.User, question)];
-        var response = await chatClient.GetResponseAsync(messages, assistant.CreateChatOptions(userGroups));
+        var response = await chatClient.GetResponseAsync(messages, assistant.CreateChatOptions(userGroups, sources));
 
-        // What the Search tool returned to the model during this answer
-        // It collects what search returned from the response's FunctionResultContent (the tool results) and extracts the file names from the <result filename="..."> tags.
-        var chunks = response.Messages
-            .SelectMany(m => m.Contents)
-            .OfType<FunctionResultContent>()
-            .SelectMany(r => AsStrings(r.Result))
-            .ToList();
-        var documents = chunks
-            .Select(c => ResultFilename().Match(c))
-            .Where(m => m.Success)
-            .Select(m => m.Groups["file"].Value)
-            .Distinct()
-            .ToList();
+        // What the Search tool returned to the model during this answer: every hit is registered in `sources`
+        var chunks = sources.All.Select(hit => hit.Chunk.Text).ToList();
+        var documents = sources.All.Select(hit => hit.Chunk.DocumentId).Distinct().ToList();
 
         return new RagAnswer(messages, response, chunks, documents);
     }
@@ -99,17 +94,4 @@ public sealed partial class RagFixture : IAsyncLifetime
             await _app.DisposeAsync();
         }
     }
-
-    private static IEnumerable<string> AsStrings(object? result) => result switch
-    {
-        IEnumerable<string> strings => strings,
-        JsonElement { ValueKind: JsonValueKind.Array } array => array.EnumerateArray().Select(e => e.GetString() ?? ""),
-        null => [],
-        _ => [result.ToString() ?? ""]
-    };
-
-    // Matches the start of a search result, e.g. <result filename="x.pdf" page="3" section="...">, and captures the file name.
-    // No closing ">" right after filename, because page/section attributes follow it.
-    [GeneratedRegex("<result filename=\"(?<file>[^\"]+)\"")]
-    private static partial Regex ResultFilename();
 }

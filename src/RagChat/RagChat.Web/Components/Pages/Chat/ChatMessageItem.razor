@@ -1,4 +1,4 @@
-@using System.Runtime.CompilerServices
+﻿@using System.Runtime.CompilerServices
 @using System.Text.RegularExpressions
 @using System.Linq
 
@@ -26,9 +26,9 @@ else if (Message.Role == ChatRole.Assistant)
                 <div class="assistant-message-text">
                     <assistant-message markdown="@text"></assistant-message>
 
-                    @foreach (var citation in citations ?? [])
+                    @foreach (var (number, hit) in citations ?? [])
                     {
-                        <ChatCitation File="@citation.File" Quote="@citation.Quote" />
+                        <ChatCitation Number="number" File="@hit.Chunk.DocumentId" Page="hit.Chunk.PageNumber" Quote="@(hit.Caption ?? hit.Chunk.Text)" />
                     }
                 </div>
             </div>
@@ -69,9 +69,14 @@ else if (Message.Role == ChatRole.Assistant)
 
 @code {
     private static readonly ConditionalWeakTable<ChatMessage, ChatMessageItem> SubscribersLookup = new();
-    private static readonly Regex CitationRegex = new(@"<citation filename='(?<file>[^']*)'>(?<quote>.*?)</citation>", RegexOptions.NonBacktracking);
+    // The model cites search results by id: [3] or [1][4]
+    private static readonly Regex CitationRegex = new(@"\[(?<id>\d+)\]", RegexOptions.NonBacktracking);
 
-    private List<(string File, string Quote)>? citations;
+    private List<(int Number, SearchHit Hit)>? citations;
+
+    // Search results of this conversation, provided by Chat.razor
+    [CascadingParameter]
+    public CitationSources? Sources { get; set; }
 
     [Parameter, EditorRequired]
     public required ChatMessage Message { get; set; }
@@ -97,11 +102,15 @@ else if (Message.Role == ChatRole.Assistant)
         }
     }
 
+    // Turns each cited id into its stored chunk (file, page, verbatim passage). Unknown ids are ignored.
     private void ParseCitations(string text)
     {
-        var matches = CitationRegex.Matches(text);
-        citations = matches.Any()
-            ? matches.Select(m => (m.Groups["file"].Value, m.Groups["quote"].Value)).ToList()
-            : null;
+        citations = CitationRegex.Matches(text)
+            .Select(m => int.Parse(m.Groups["id"].Value))
+            .Distinct()
+            .Select(number => (Number: number, Hit: Sources?.Get(number)))
+            .Where(c => c.Hit is not null)
+            .Select(c => (c.Number, c.Hit!))
+            .ToList();
     }
 }

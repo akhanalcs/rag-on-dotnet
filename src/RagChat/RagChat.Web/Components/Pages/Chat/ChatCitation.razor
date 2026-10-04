@@ -1,4 +1,5 @@
-﻿@using System.Web
+@using System.Web
+@* One source chip: [n] file · page, plus the exact passage from the source. Clicking opens the document at that page with the passage highlighted. *@
 @if (!string.IsNullOrWhiteSpace(viewerUrl))
 {
     <a href="@viewerUrl" target="_blank" class="citation">
@@ -6,7 +7,7 @@
             <path stroke-linecap="round" stroke-linejoin="round" d="M19.5 14.25v-2.625a3.375 3.375 0 0 0-3.375-3.375h-1.5A1.125 1.125 0 0 1 13.5 7.125v-1.5a3.375 3.375 0 0 0-3.375-3.375H8.25m0 12.75h7.5m-7.5 3H12M10.5 2.25H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 0 0-9-9Z" />
         </svg>
         <div class="citation-content">
-            <div class="citation-file">@File</div>
+            <div class="citation-file">@(Number is null ? "" : $"[{Number}] ")@File@(Page is null ? "" : $" · page {Page}")</div>
             <div>@Quote</div>
         </div>
     </a>
@@ -14,8 +15,15 @@
 
 @code {
     [Parameter]
+    public int? Number { get; set; }
+
+    [Parameter]
     public required string File { get; set; }
 
+    [Parameter]
+    public int? Page { get; set; }
+
+    // Verbatim text from the indexed chunk (the semantic ranker's caption), never model-written
     [Parameter]
     public string? Quote { get; set; }
 
@@ -23,17 +31,18 @@
 
     protected override void OnParametersSet()
     {
-        viewerUrl = null;
+        // The viewers search for a short, exact phrase; the first words of the passage are enough to land on it
+        var phrase = Quote is null ? "" : string.Join(' ', Quote.Split(' ', StringSplitOptions.RemoveEmptyEntries).Take(8)).Trim('.', ',', '"', '\'');
 
-        // If you ingest other types of content besides Markdown or PDF files, construct a URL to an appropriate viewer here
-        if (File.EndsWith(".md"))
+        // Files come from the authorized /documents endpoint (see DocumentEndpoints.cs)
+        viewerUrl = Path.GetExtension(File).ToLowerInvariant() switch
         {
-            viewerUrl = $"lib/markdown_viewer/viewer.html?file=/documents/{HttpUtility.UrlEncode(File)}#:~:text={Uri.EscapeDataString(Quote ?? "")}";
-        }
-        else if (File.EndsWith(".pdf"))
-        {
-            var search = Quote?.Trim('.', ',', ' ', '\n', '\r', '\t', '"', '\'');
-            viewerUrl = $"lib/pdf_viewer/viewer.html?file=/documents/{HttpUtility.UrlEncode(File)}#search={HttpUtility.UrlEncode(search)}&phrase=true";
-        }
+            // Browser text fragment: scrolls to and highlights the phrase
+            ".md" => $"lib/markdown_viewer/viewer.html?file=/documents/{HttpUtility.UrlEncode(File)}#:~:text={Uri.EscapeDataString(phrase)}",
+            // PDF.js: open the cited page and highlight the phrase on it
+            ".pdf" => $"lib/pdf_viewer/viewer.html?file=/documents/{HttpUtility.UrlEncode(File)}#page={Page ?? 1}&search={HttpUtility.UrlEncode(phrase)}&phrase=true",
+            // Anything else (e.g. .docx): download the original
+            _ => $"/documents/{HttpUtility.UrlEncode(File)}"
+        };
     }
 }

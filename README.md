@@ -629,11 +629,11 @@ On the free tier you have to assign users directly. Assigning *groups* to roles 
 Sign in as alice, ask about the radio's range, and you should get nothing. Sign in as bob and you'll get the answer.
 
 ## Ingestion v2 + hybrid search (Azure AI Search)
-Our own thin "push" pipeline (we read, chunk, embed and upload), built on Microsoft SDKs: `IEmbeddingGenerator` (Microsoft.Extensions.AI), `Azure.Search.Documents`, and PdfPig, to be replaced by Document Intelligence.
+Our own thin "push" pipeline (we read, chunk, embed and upload), built on Microsoft SDKs: `IEmbeddingGenerator` (Microsoft.Extensions.AI), `Azure.Search.Documents` and `Azure.AI.DocumentIntelligence`.
 
 ```mermaid
 flowchart LR
-    F[File] -->|.pdf| P["PdfReader (PdfPig)<br/>paragraph blocks + page #"]
+    F[File] -->|.pdf .docx| P["DocumentIntelligenceReader<br/>prebuilt-layout: OCR, paragraphs + page #,<br/>section headings, drops headers/footers"]
     F -->|.md| M["MarkdownReader<br/>paragraph blocks + heading path"]
     P --> C["Chunker<br/>whole paragraphs, ≤500 tokens,<br/>new chunk per section"]
     M --> C
@@ -664,6 +664,23 @@ flowchart LR
     SR --> Top[Top 5 → model]
 ```
 
+1. BM25 (Best Matching 25) is a classic keyword-based search algorithm to estimate how relevant a document is to a search query based on exact keyword matches.
+2. HNSW (Hierarchical Navigable Small World) is a graph-based data structure used to perform fast, approximate nearest neighbor (ANN) searches in high-dimensional vector spaces.
+3. RRF (Reciprocal Rank Fusion) is an ensemble algorithm used to merge multiple ranked lists from different search models (like combining a BM25 keyword search and a HNSW semantic vector search).
+
+**Hybrid Search:**
+1. A user types a query.
+2. BM25 runs a keyword search to grab exact matches (like serial numbers or specific names).
+3. HNSW executes a vector search to grab semantic meaning (finding "feline" when the user typed "cat").
+4. RRF takes the results from both BM25 and HNSW, blends their ranks together, and hands the user the definitive best list.
+
+```bash
+cd ~/RiderProjects/rag-on-dotnet/src/RagChat
+dotnet remove RagChat.Web package PdfPig
+dotnet add RagChat.Web package Azure.AI.DocumentIntelligence
+dotnet add RagChat.Web package Azure.Identity
+```
+
 | Term | Meaning |
 |---|---|
 | **BM25** | Classic keyword ranking: rare words that appear often in a chunk score high. Finds exact strings that vectors miss |
@@ -672,17 +689,47 @@ flowchart LR
 | **Caption** | The sentence(s) in a chunk that best answer the question, copied word for word. Used for citation highlights |
 | **HNSW** | The graph index behind fast vector search |
 
-Read the code in this order: `IngestedChunk.cs` (the index schema) → `Ingestion/DocumentBlock.cs` → `PdfReader.cs` / `MarkdownReader.cs` → `Chunker.cs` → `DataIngestor.cs` → `SemanticSearch.cs` → `RagAssistant.cs`.
+Read the code in this order: `IngestedChunk.cs` (the index schema) → `Ingestion/DocumentBlock.cs` → `DocumentIntelligenceReader.cs` / `MarkdownReader.cs` → `Chunker.cs` → `DataIngestor.cs` → `SemanticSearch.cs` → `RagAssistant.cs`.
 
 **Interview: why Azure AI Search instead of Qdrant.** At Marathon the knowledge base was IT articles and tickets: semantic Q&A, cost-sensitive, so Qdrant was the right call. Legal content needs exact-term recall (case names, statute sections, matter numbers), reranking, and enterprise controls (Entra ID, private endpoints, customer-managed keys). Azure AI Search gives hybrid search + a reranker in one query. I chose the tool by requirement.
 
 **Interview: why not Microsoft's DataIngestion pipeline.** It's still in preview, and its chunks don't carry the page they came from. In legal work "show me exactly where it says that" is the whole point. So I kept Microsoft's building blocks (`IEmbeddingGenerator`, `Azure.Search.Documents`) and wrote a thin pipeline around them: layout-aware reader, structure-aware chunking, stable keys, content hashing. Next: Document Intelligence as the reader, for OCR (scanned contracts) and tables.
+
+**Interview: why Document Intelligence.** Law firms have lots of scanned documents (signed agreements, old filings). A plain PDF text reader (PdfPig, PyPDF) returns nothing for a scan. `prebuilt-layout` does OCR and returns paragraphs with page numbers and roles (title, section heading, header/footer), so chunks know their section and boilerplate is dropped. About $10 per 1,000 pages; the content hash means a document is only analyzed again when it changes. At high volume: read the text layer locally and send only pages without text to OCR.
+
+**Chunk overlap.** Character splitters (e.g. LangChain's 1000 chars / 200 overlap) cut mid-sentence and need big overlaps. We cut only between paragraphs, so overlap is small: the previous chunk's last paragraph is carried over when it's ≤ 75 tokens (~15%) and the section didn't change.
 
 **Interview: tokenizers.** Tokenizers are model-specific. Chunks are sized with the embedding model's tokenizer (cl100k for `text-embedding-3-small`). Prompt budgeting for the chat model would use o200k.
 
 **Cost:** Aspire creates the search service on the Basic tier (about $75/month). Delete the resource group when not in use.
 
 
+
+## Citations: receipts, not quotes
+The model cites search results by **number**; the UI turns each number back into the **stored chunk**. The model never writes the quote, so it can't misquote the source.
+
+```mermaid
+sequenceDiagram
+    participant M as Model
+    participant T as Search tool
+    participant S as CitationSources (per conversation)
+    participant UI as ChatMessageItem / ChatCitation
+    participant V as PDF/Markdown viewer
+    M->>T: Search("two-way radio range")
+    T->>S: register hits → ids 1..5
+    T-->>M: <result id="3" filename="…pdf" page="11">…</result>
+    M-->>UI: "The radio reaches up to 20 miles [3]."
+    UI->>S: Get(3) → file, page 11, caption (verbatim, from the semantic ranker)
+    UI-->>V: open /documents/…pdf at #page=11, highlight the caption
+```
+
+- **Number, not quote:** a model can fabricate a plausible quote; it can't fabricate what's stored under id 3.
+- **Exact place:** the chip shows `[3] file · page 11` and the passage itself. Clicking opens the PDF on that page with the passage highlighted (Markdown: browser text fragment).
+- **Same idea as GitHub's [Eyeball](https://github.com/dvelton/eyeball):** in hallucination-sensitive work, show the source, don't just claim it.
+- **Still behind authorization:** files come from `/documents/{name}`, which re-checks the ethical-wall policy.
+- Next step (not built): highlight the exact region with Document Intelligence's bounding polygons instead of a text search.
+
+Files: `Services/CitationSources.cs`, `Services/RagAssistant.cs` (prompt + ids), `Components/Pages/Chat/ChatMessageItem.razor` (parses `[n]`), `ChatCitation.razor` (chip + viewer link).
 
 --- OLD STUFFS BELOW ---
 
