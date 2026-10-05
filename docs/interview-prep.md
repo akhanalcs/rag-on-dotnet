@@ -2,6 +2,57 @@
 
 Answers I should be able to give and defend. Each answer states the trade-off, not just the choice. Every claim here should match what I actually built, either at work or in this repo.
 
+## "Tell me about your RAG system" (the story)
+
+> Before saying this, check every line against what I actually built, and change anything that isn't true. Say "I", give real numbers, and stop after about two minutes so they can ask follow-ups.
+
+**Short version (≈30 seconds)**
+"I built a RAG knowledge base at Marathon on .NET 10. A scheduled Azure Function pulls ServiceNow knowledge articles and resolved tickets, embeds them with Azure OpenAI, and stores them in Qdrant with source metadata. Engineers ask questions in a Blazor app built on Microsoft.Extensions.AI and get answers that link straight to the KB article or ticket. It cut the time to find information by about 90%. The next step was documents (PDF policies, procedures, manuals), and that's where citations got harder. That pushed me to hybrid search, reranking, and page-level citations, which I think is exactly the problem a law firm has."
+
+**Full version (≈2 minutes): v1 → what I learned → v2**
+
+*v1: ServiceNow (what's on my resume)*
+- **Ingestion:** a timer-triggered Azure Function calls the ServiceNow Table API and pulls only records changed since the last run (a watermark on `sys_updated_on`). It runs separately from the web app, so a slow ingestion run never affects chat.
+- **Idempotent:** the chunk key comes from the record's `sys_id` plus the chunk's position, and a content hash skips unchanged records. Re-running never creates duplicates, and retired articles get their chunks deleted.
+- **Tickets as documents:** one resolved ticket becomes one document in the form *problem → diagnosis → resolution*: short description, description, filtered work notes, close notes. PII is redacted before embedding. The ticket number, type, assignment group and CI are stored as metadata.
+- **Citations are easy here:** every chunk carries its ServiceNow URL, so a citation links to the exact KB article or ticket.
+- **Security:** answers are trimmed by the user's groups at retrieval time, inside the vector search filter. (Our code of conduct separates departments; for example, an oil-extraction user must not see transportation-logistics operations data.) The group list is captured in code, never passed as a tool parameter, so a prompt can't widen it.
+- **Quality:** a golden set of real questions, each paired with the document that should answer it. In CI, one check confirms the right document was retrieved, and LLM-as-judge scores (`Microsoft.Extensions.AI.Evaluation`) measure relevance and groundedness. A drop in quality fails the build.
+
+*What changed: documents (PDFs)*
+- A ServiceNow record **is** its own citation: one URL. A 60-page PDF isn't. "See policy.pdf" doesn't help anyone, and the user needs **the page and the passage**.
+- **Plain vector search misses exact terms**: policy numbers, section numbers, error codes, names. Meaning-based search alone ranks them poorly.
+- **Scanned PDFs** have no text layer, so a normal PDF parser returns nothing for them.
+
+*v2: what I'm building for documents*
+- **Reader:** Azure AI Document Intelligence (`prebuilt-layout`). OCR for scans, plus every paragraph with its **page number** and **role** (section heading, header and footer are dropped).
+- **Chunking:** whole paragraphs only, up to about 500 tokens, with a new chunk at each section heading and a small overlap. Each chunk stores its **page** and **section path**.
+- **Search: Azure AI Search, one query that does:**
+  - **hybrid** search: BM25 keyword + vector, merged with Reciprocal Rank Fusion
+  - the **semantic ranker** re-scores the top results
+  - an extractive **caption**: the exact sentence that answers the question
+  - the security filter, applied inside the index
+- **Citations: receipts, not quotes.**
+  - Each result gets an id, and the model cites ids (`[3]`).
+  - The UI resolves `[3]` to the stored chunk and opens the original PDF **at that page with the passage highlighted**.
+  - The model never writes the quote, so it can't misquote the source.
+  - Source files are served through an endpoint that re-checks permissions.
+
+**Why I moved from Qdrant to Azure AI Search for v2**
+"Qdrant was the right choice for v1: semantic Q&A over IT content, cheap, simple. For documents I needed exact-term recall and reranking, and Azure AI Search does hybrid search plus a reranker in one query. It also brings Entra ID, private endpoints and customer-managed keys, which matter in regulated environments. I picked the tool for the requirement, not out of habit."
+
+**Why it fits Milbank:** "In legal work, 'show me exactly where it says that' is the requirement. Ethical walls have to be enforced in retrieval, not in the prompt. Quality has to be measured, not assumed. That's how I designed it."
+
+**Likely follow-ups, with short answers**
+| Question | Answer |
+|---|---|
+| Why not just tell the model "don't reveal X"? | Prompts aren't security. Forbidden chunks are filtered out before the model sees anything, and the source files go through the same check. |
+| How do you know answers are correct? | A golden set in CI: a deterministic retrieval check plus groundedness and relevance scored by an LLM judge. Plus citations a user can verify in one click. |
+| What happens when a model is retired? | The app calls a deployment name, so only the infrastructure config changes. For an *embedding* model, I re-embed into a new index and swap, which is cheap because ingestion is idempotent and automated. |
+| Chunk size? | Structure first (sections, ticket fields), then a token budget of about 300–800, tuned against the golden set. Large chunks dilute the embedding; small ones lose context. |
+| Why does hybrid matter? | Vectors find meaning ("terminate for cause"); BM25 finds exact strings ("§ 9.3", "INC0012345"). Legal and IT text needs both. |
+| Cost? | Embeddings cost about $0.02 per 1M tokens, and a mini chat model about $0.002 per question. The content hash avoids paying to re-process unchanged documents. |
+
 ## Model choices
 
 ### Why `text-embedding-3-small`?

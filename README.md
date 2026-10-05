@@ -731,6 +731,32 @@ sequenceDiagram
 
 Files: `Services/CitationSources.cs`, `Services/RagAssistant.cs` (prompt + ids), `Components/Pages/Chat/ChatMessageItem.razor` (parses `[n]`), `ChatCitation.razor` (chip + viewer link).
 
+## CLeanup
+```bash
+$ az resource list -g rg-ragchat-dev-eastus2 -o table
+Name                  ResourceGroup           Location    Type                                  Status
+--------------------  ----------------------  ----------  ------------------------------------  ---------
+openai-g5rbceqptic4m  rg-ragchat-dev-eastus2  eastus2     Microsoft.CognitiveServices/accounts  Succeeded
+$ az group delete -n rg-ragchat-dev-eastus2 --yes
+```
+
+Purge the soft deleted items.
+```bash
+$ az cognitiveservices account list-deleted -o table
+Kind    Location    Name
+------  ----------  --------------------
+OpenAI  eastus2     openai-g5rbceqptic4m
+$ az cognitiveservices account purge -g rg-ragchat-dev-eastus2 -l eastus2 -n openai-g5rbceqptic4m
+```
+
+Open .NET user secrets, i.e. `secrets.json`, remove every line that starts with `"Azure:Deployments:` and keep these:
+```json
+"Azure:SubscriptionId": "...",
+"Azure:ResourceGroup": "rg-ragchat-dev-eastus2",
+"Azure:Location": "eastus2",
+"Azure:AllowResourceGroupCreation": "True",
+```
+
 --- OLD STUFFS BELOW ---
 
 ## Configure AI model provider (I had chosen `githubmodels`)
