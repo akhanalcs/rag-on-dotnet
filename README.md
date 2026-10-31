@@ -5,7 +5,122 @@ It's a RAG (Retrieval-Augmented Generation) application that uses a vector datab
 Simply put, LLMs can't access your company's information directly. RAG lets you share relevant documents with the LLM, 
 so it can answer your questions using your own data. [Short summary](https://youtube.com/shorts/xS55duPS-Pw?si=9iAMDJ593p34ZAG6).
 
-**Interview prep:** [docs/interview-prep.md](docs/interview-prep.md) covers model choices, chunk sizing, ServiceNow RAG design, and what a law-firm RAG needs.
+## How it works (current state)
+This is the app as it is today. Sections further down are the history of how it got here, and some of them still show Qdrant.
+
+### The big picture
+Two flows share one index. **Ingestion** fills it (once, lazily, on the first search). **Answering** reads it, trimmed to what the signed-in user may see.
+
+```mermaid
+flowchart TB
+    subgraph ING["① Ingestion: runs once, on the first LoadDocuments / Search call"]
+        direction LR
+        F[("Data/<br/>.pdf .docx .md")] --> H{"SHA-256 of file + allowed groups<br/>same as what's indexed?"}
+        H -- yes --> SKIP[Skip the file]
+        H -- no --> R["Read into paragraphs<br/>.pdf/.docx → Document Intelligence<br/>.md → MarkdownReader"]
+        R --> CH["Chunker<br/>whole paragraphs, ≤500 tokens,<br/>new chunk per section"]
+        CH --> E["Embed all chunks in one batch<br/>text-embedding-3-small"]
+        E --> UP["Upload, then delete leftovers<br/>each chunk: page, section, allowed_groups"]
+    end
+
+    UP --> IDX[("Azure AI Search<br/>index: ragchat-chunks")]
+
+    subgraph ASK["② Answering a question"]
+        direction LR
+        U(["User signs in with Entra ID<br/>token roles = COC-6"]) --> C["Chat.razor<br/>tools are bound to the user's groups"]
+        C --> M["gpt-5-mini<br/>decides to call Search"]
+        M --> S["SemanticSearch<br/>embed question → hybrid query<br/>filter: allowed_groups ∈ user's groups"]
+        S --> T["Top 5 chunks, numbered 1..5<br/>kept in CitationSources"]
+        T --> M2["gpt-5-mini<br/>answers only from them, cites [n]"]
+        M2 --> UI["Citation chip<br/>[n] → file · page · exact passage"]
+        UI --> D["/documents/{name}<br/>checks policy again → file or 404"]
+    end
+
+    S <--> IDX
+```
+
+### One question, step by step
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as User (bob, COC-6)
+    participant C as Chat.razor + ChatMessageItem
+    participant CC as IChatClient (UseFunctionInvocation)
+    participant M as gpt-5-mini
+    participant T as Search tool (RagAssistant)
+    participant S as SemanticSearch
+    participant EMB as text-embedding-3-small
+    participant AIS as Azure AI Search
+    participant CS as CitationSources
+    participant D as /documents endpoint
+
+    Note over U,C: Signed in with Entra ID. UserGroups.From(user) = [COC-6]
+    C->>T: CreateChatOptions(userGroups, citationSources)
+    Note over C,T: Groups are captured in code, not a tool parameter, so the model can't widen them
+    U->>C: "What's the range of the two-way radio?"
+    C->>CC: GetStreamingResponseAsync(messages, chatOptions)
+    CC->>M: system prompt + history + tool schemas
+    M-->>CC: call LoadDocuments()
+    CC->>S: LoadDocumentsAsync()
+    opt first call since the app started
+        S->>AIS: DataIngestor: create/update index, upload changed files' chunks
+    end
+    CC->>M: tool result: done
+    M-->>CC: call Search("two-way radio range")
+    CC->>T: run the tool
+    T->>S: SearchAsync(phrase, filename?, [COC-6], 5)
+    S->>EMB: embed the question
+    EMB-->>S: 1536 floats
+    S->>AIS: BM25 + vector (merged by RRF), semantic ranker, filter allowed_groups
+    AIS-->>S: top 5 chunks + verbatim captions
+    S-->>T: SearchHit ×5
+    T->>CS: Add(hit) → ids 1..5
+    T-->>CC: <result id="3" filename="…pdf" page="11" section="…">text</result> ×5
+    CC->>M: tool results
+    M-->>C: streamed "The radio reaches up to 20 miles [3]."
+    C->>CS: Get(3) → file, page 11, caption
+    C-->>U: answer + chip "[3] Example_Emergency_Survival_Kit.pdf · page 11"
+    U->>D: click chip → PDF viewer fetches /documents/{name}
+    D->>D: signed in? DocumentAccessPolicy.CanRead(groups, file)?
+    D-->>U: PDF opens at page 11 with the passage highlighted (404 for alice, COC-4)
+```
+
+### Who creates and wires what (Aspire)
+```mermaid
+flowchart LR
+    AH["RagChat.AppHost<br/>AppHost.cs"] -->|provisions via Bicep| OAI["Azure OpenAI<br/>deployments: chat (gpt-5-mini),<br/>text-embedding-3-small"]
+    AH -->|provisions| SRCH["Azure AI Search"]
+    AH -->|provisions| DOCI["Document Intelligence (S0)"]
+    AH -->|"starts + injects connection strings<br/>(openai, search, docintel)"| WEB["RagChat.Web"]
+    WEB -->|"AddRagChat() registers clients<br/>Entra ID / managed identity, no keys"| OAI & SRCH & DOCI
+    ENTRA["Entra ID app registration<br/>ragchat-dev (set up by hand)"] -->|"sign-in + roles claim"| WEB
+    EVAL["RagChat.Evaluation"] -->|"same AddRagChat() + same RagAssistant"| WEB
+```
+
+| Piece | File | Lifetime | Job |
+|---|---|---|---|
+| Composition root | [RagChatServiceExtensions.cs](src/RagChat/RagChat.Web/Services/RagChatServiceExtensions.cs) | n/a | Registers everything; shared by the web app and the eval tests |
+| Index schema | [IngestedChunk.cs](src/RagChat/RagChat.Web/Services/IngestedChunk.cs) | n/a | One chunk = one index document: text, section, page, groups, hash, embedding |
+| Ingestion | [DataIngestor.cs](src/RagChat/RagChat.Web/Services/Ingestion/DataIngestor.cs) | Singleton | Hash check → read → chunk → embed → upload → delete leftovers |
+| Search | [SemanticSearch.cs](src/RagChat/RagChat.Web/Services/SemanticSearch.cs) | Singleton | Caches the ingestion `Task` (runs once for everyone); one hybrid + rerank + filter query |
+| Prompt + tools | [RagAssistant.cs](src/RagChat/RagChat.Web/Services/RagAssistant.cs) | Singleton | System prompt; builds per-user tools with the groups baked in |
+| Conversation state | [Chat.razor](src/RagChat/RagChat.Web/Components/Pages/Chat/Chat.razor) | Per conversation | Holds messages, `userGroups` and its own `CitationSources` |
+| Citations | [CitationSources.cs](src/RagChat/RagChat.Web/Services/CitationSources.cs), [ChatMessageItem.razor](src/RagChat/RagChat.Web/Components/Pages/Chat/ChatMessageItem.razor), [ChatCitation.razor](src/RagChat/RagChat.Web/Components/Pages/Chat/ChatCitation.razor) | Per conversation | `[n]` → stored chunk → chip → viewer link |
+| Ethical walls | [DocumentAccessPolicy.cs](src/RagChat/RagChat.Web/Services/Security/DocumentAccessPolicy.cs), [UserGroups.cs](src/RagChat/RagChat.Web/Services/Security/UserGroups.cs), [DocumentEndpoints.cs](src/RagChat/RagChat.Web/Services/Security/DocumentEndpoints.cs) | Singleton / static | Who may read what; enforced at ingestion (stamp), search (filter) and file download (404) |
+
+**Design note: DI lifetimes.** The expensive, stateless pieces (clients, search, ingestion) are singletons. Anything about *one user* (their groups, their citation numbers) lives in the Blazor component, one per conversation. So one user's state never leaks into another's, and the ingestion `Task` is shared on purpose.
+
+**Design note: why the model only sees numbers.** The two security-relevant choices (which groups to filter on, and what a citation points to) are made in code, not by the model. The model chooses *what to search for* and *which result id to cite*, nothing else.
+
+**Read the code in this order:**
+1. [AppHost.cs](src/RagChat/RagChat.AppHost/AppHost.cs): which Azure resources exist
+2. [Program.cs](src/RagChat/RagChat.Web/Program.cs) → [RagChatServiceExtensions.cs](src/RagChat/RagChat.Web/Services/RagChatServiceExtensions.cs): sign-in, then DI wiring
+3. [IngestedChunk.cs](src/RagChat/RagChat.Web/Services/IngestedChunk.cs): what's stored
+4. [DocumentBlock.cs](src/RagChat/RagChat.Web/Services/Ingestion/DocumentBlock.cs) → [DocumentIntelligenceReader.cs](src/RagChat/RagChat.Web/Services/Ingestion/DocumentIntelligenceReader.cs) / [MarkdownReader.cs](src/RagChat/RagChat.Web/Services/Ingestion/MarkdownReader.cs) → [Chunker.cs](src/RagChat/RagChat.Web/Services/Ingestion/Chunker.cs) → [DataIngestor.cs](src/RagChat/RagChat.Web/Services/Ingestion/DataIngestor.cs): how it gets there
+5. [SemanticSearch.cs](src/RagChat/RagChat.Web/Services/SemanticSearch.cs): how it's found
+6. [RagAssistant.cs](src/RagChat/RagChat.Web/Services/RagAssistant.cs) → [Chat.razor](src/RagChat/RagChat.Web/Components/Pages/Chat/Chat.razor): how the model uses it
+7. [CitationSources.cs](src/RagChat/RagChat.Web/Services/CitationSources.cs) → [ChatMessageItem.razor](src/RagChat/RagChat.Web/Components/Pages/Chat/ChatMessageItem.razor) → [ChatCitation.razor](src/RagChat/RagChat.Web/Components/Pages/Chat/ChatCitation.razor) → [DocumentEndpoints.cs](src/RagChat/RagChat.Web/Services/Security/DocumentEndpoints.cs): how the answer points back to the source
+8. [RagFixture.cs](src/RagChat/RagChat.Evaluation/RagFixture.cs) → [RagQualityTests.cs](src/RagChat/RagChat.Evaluation/RagQualityTests.cs) / [SecurityTrimmingTests.cs](src/RagChat/RagChat.Evaluation/SecurityTrimmingTests.cs): how it's measured
 
 ## Helpful Links
 - [Exploring the new AI chat template](https://andrewlock.net/exploring-the-new-ai-chat-template/)
@@ -353,13 +468,13 @@ Pay per token; no hourly charge. Retail prices for eastus2 ([Azure Retail Prices
 **Useful while debugging:**
 - Aspire logs: `~/.aspire/logs/cli_*.log`. The debug console only shows state changes.
 
-**Interview notes:**
+**Design notes:**
 - **Deployment name ≠ model name.** The app asks for the deployment `chat`, so when a model is retired only `AppHost.cs` changes.
 - **SKU = data residency.** Standard processes requests in your region, DataZoneStandard keeps them in the US or EU, and GlobalStandard can route anywhere. For a law firm, prefer DataZone or Standard.
 - **No keys.** `disableLocalAuth: true` plus an RBAC role assignment (`Cognitive Services OpenAI User`). Locally that's my identity; deployed, it's the app's managed identity.
 - **Azure OpenAI vs Foundry resource.** The template uses `AddAzureOpenAI` (a classic Azure OpenAI resource, OpenAI models only). A Foundry resource (Aspire's `Aspire.Hosting.Foundry`, still in preview) also offers non-OpenAI models, agents and evaluations, and it shows up in the New Foundry portal. Microsoft is steering new work toward Foundry.
 
-## Challenges & lessons (interview prep)
+## Challenges & lessons
 Each one is phrased as **problem → cause → what I did → what I'd do in production**.
 
 1. **Duplicate chunks on every restart (non-idempotent ingestion).**
@@ -565,9 +680,7 @@ sequenceDiagram
     end
     T->>F: DisposeAsync (stop containers)
 ```
-**Interview line:**
-
-The evaluation suite runs in CI against a dedicated, pre-provisioned resource group. The pipeline identity can only call models, not create resources, and a drop in quality fails the build just like a failing unit test.
+**In one line:** the evaluation suite runs in CI against a dedicated, pre-provisioned resource group. The pipeline identity can only call models, not create resources, and a drop in quality fails the build just like a failing unit test.
 
 ## Step 2: security trimming (ethical walls)
 ```mermaid
@@ -691,15 +804,15 @@ dotnet add RagChat.Web package Azure.Identity
 
 Read the code in this order: `IngestedChunk.cs` (the index schema) → `Ingestion/DocumentBlock.cs` → `DocumentIntelligenceReader.cs` / `MarkdownReader.cs` → `Chunker.cs` → `DataIngestor.cs` → `SemanticSearch.cs` → `RagAssistant.cs`.
 
-**Interview: why Azure AI Search instead of Qdrant.** At Marathon the knowledge base was IT articles and tickets: semantic Q&A, cost-sensitive, so Qdrant was the right call. Legal content needs exact-term recall (case names, statute sections, matter numbers), reranking, and enterprise controls (Entra ID, private endpoints, customer-managed keys). Azure AI Search gives hybrid search + a reranker in one query. I chose the tool by requirement.
+**Design note: why Azure AI Search instead of Qdrant.** At Marathon the knowledge base was IT articles and tickets: semantic Q&A, cost-sensitive, so Qdrant was the right call. Legal content needs exact-term recall (case names, statute sections, matter numbers), reranking, and enterprise controls (Entra ID, private endpoints, customer-managed keys). Azure AI Search gives hybrid search + a reranker in one query. I chose the tool by requirement.
 
-**Interview: why not Microsoft's DataIngestion pipeline.** It's still in preview, and its chunks don't carry the page they came from. In legal work "show me exactly where it says that" is the whole point. So I kept Microsoft's building blocks (`IEmbeddingGenerator`, `Azure.Search.Documents`) and wrote a thin pipeline around them: layout-aware reader, structure-aware chunking, stable keys, content hashing. Next: Document Intelligence as the reader, for OCR (scanned contracts) and tables.
+**Design note: why not Microsoft's DataIngestion pipeline.** It's still in preview, and its chunks don't carry the page they came from. In legal work "show me exactly where it says that" is the whole point. So I kept Microsoft's building blocks (`IEmbeddingGenerator`, `Azure.Search.Documents`) and wrote a thin pipeline around them: layout-aware reader, structure-aware chunking, stable keys, content hashing. Next: Document Intelligence as the reader, for OCR (scanned contracts) and tables.
 
-**Interview: why Document Intelligence.** Law firms have lots of scanned documents (signed agreements, old filings). A plain PDF text reader (PdfPig, PyPDF) returns nothing for a scan. `prebuilt-layout` does OCR and returns paragraphs with page numbers and roles (title, section heading, header/footer), so chunks know their section and boilerplate is dropped. About $10 per 1,000 pages; the content hash means a document is only analyzed again when it changes. At high volume: read the text layer locally and send only pages without text to OCR.
+**Design note: why Document Intelligence.** Law firms have lots of scanned documents (signed agreements, old filings). A plain PDF text reader (PdfPig, PyPDF) returns nothing for a scan. `prebuilt-layout` does OCR and returns paragraphs with page numbers and roles (title, section heading, header/footer), so chunks know their section and boilerplate is dropped. About $10 per 1,000 pages; the content hash means a document is only analyzed again when it changes. At high volume: read the text layer locally and send only pages without text to OCR.
 
 **Chunk overlap.** Character splitters (e.g. LangChain's 1000 chars / 200 overlap) cut mid-sentence and need big overlaps. We cut only between paragraphs, so overlap is small: the previous chunk's last paragraph is carried over when it's ≤ 75 tokens (~15%) and the section didn't change.
 
-**Interview: tokenizers.** Tokenizers are model-specific. Chunks are sized with the embedding model's tokenizer (cl100k for `text-embedding-3-small`). Prompt budgeting for the chat model would use o200k.
+**Design note: tokenizers.** Tokenizers are model-specific. Chunks are sized with the embedding model's tokenizer (cl100k for `text-embedding-3-small`). Prompt budgeting for the chat model would use o200k.
 
 **Cost:** Aspire creates the search service on the Basic tier (about $75/month). Delete the resource group when not in use.
 
