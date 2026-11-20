@@ -401,3 +401,6 @@ FodyWeavers.xsd
 .idea
 
 .DS_Store
+# CLAUDE.md
+# AI evaluation results (local reports + response cache)
+eval-results/
